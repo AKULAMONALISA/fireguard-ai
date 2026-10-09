@@ -1,16 +1,17 @@
-from ultralytics import YOLO
+﻿from ultralytics import YOLO
 
 
 class FireDetector:
 
     def __init__(self, model_path):
         self.model = YOLO(model_path)
+        print("MODEL CLASS NAMES:", self.model.names)
 
     def detect(self, frame):
 
         results = self.model(
             frame,
-            conf=0.35,
+            conf=0.10,
             verbose=False
         )
 
