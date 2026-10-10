@@ -1,43 +1,153 @@
 ﻿
 import sys
+import time
+import threading
 from pathlib import Path
 from datetime import datetime
 
+import av
 import cv2
 import pandas as pd
 import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
-ROOT = Path(__file__).resolve().parent.parent
+# --------------------------------------------------
+# PATHS AND PROJECT IMPORTS
+# --------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.incident_history import load_incidents, save_incident
+MODEL_PATH = ROOT / "models" / "best.pt"
+VIDEO_DIR = ROOT / "videos"
+RESULTS_DIR = ROOT / "results"
+
+VIDEO_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
+
 from src.detector import FireDetector
 from src.tracker import FireTracker
 from src.verifier import FireVerifier
 from src.risk_engine import RiskEngine
+from src.incident_history import load_incidents, save_incident
 
 try:
     from src.email_alert import send_email_alert
-except ImportError as exc:
+except ImportError:
     send_email_alert = None
-    print(f"Email module import failed: {exc}")
 
-MODELS_DIR = ROOT / "models"
-VIDEOS_DIR = ROOT / "videos"
-RESULTS_DIR = ROOT / "results"
-MODEL_PATH = MODELS_DIR / "best.pt"
-DEFAULT_VIDEO_PATH = VIDEOS_DIR / "fire.mp4"
-ANNOTATED_VIDEO_PATH = RESULTS_DIR / "fireguard_annotated.mp4"
 
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="FIREGUARD AI",
+    page_title="FireGuard",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# --------------------------------------------------
+# STYLING
+# --------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #f3f6fb;
+        color: #17263c;
+    }
+
+    [data-testid="stHeader"] {
+        background: #f3f6fb;
+    }
+
+    section.main > div.block-container {
+        max-width: 1500px;
+        padding: 1.5rem 2rem 3rem;
+    }
+
+    .hero {
+        background: linear-gradient(
+            115deg, #14243a, #244b76, #9f2530
+        );
+        border-radius: 20px;
+        padding: 30px 34px;
+        margin-bottom: 22px;
+        box-shadow: 0 10px 28px rgba(20,36,58,.12);
+    }
+
+    .hero * {
+        color: white !important;
+    }
+
+    .hero .eyebrow {
+        color: #fecaca !important;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 3px;
+    }
+
+    .hero h1 {
+        font-size: 40px !important;
+        margin: 10px 0 !important;
+    }
+
+    .hero p {
+        color: #e1eafa !important;
+        font-size: 16px;
+    }
+
+    .kicker {
+        color: #2457d6;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1.8px;
+        margin: 18px 0 6px;
+    }
+
+    div[data-testid="stMetric"] {
+        background: white;
+        border: 1px solid #dce4ee;
+        border-radius: 15px;
+        padding: 16px;
+        box-shadow: 0 3px 12px rgba(20,36,58,.04);
+    }
+
+    [data-testid="stSidebar"] {
+        background: white;
+        border-right: 1px solid #dce4ee;
+    }
+
+    div.stButton > button,
+    div.stDownloadButton > button {
+        border-radius: 10px;
+        min-height: 42px;
+        font-weight: 700;
+    }
+
+    div.stButton > button[kind="primary"] {
+        background: #dc2626;
+        border-color: #dc2626;
+        color: white;
+    }
+
+    hr {
+        border-color: #dce4ee;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
 
 DEFAULTS = {
     "fg_report": "",
@@ -49,922 +159,1100 @@ DEFAULTS = {
     "fg_email_notice": None,
     "fg_status": "STANDBY",
     "fg_confidence": 0.0,
-    "fg_risk_level": "—",
-    "fg_risk_score": 0.0,
+    "fg_risk_level": "LOW",
+    "fg_risk_score": 0,
     "fg_frames": 0,
     "fg_last_video": "",
     "fg_latitude": 13.6288,
     "fg_longitude": 79.4192,
+    "fg_live_saved_key": None,
+    "fg_live_processor": None,
 }
 
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-st.markdown("""
-<style>
-.stApp {background:#f3f6fb;color:#17263c}
-[data-testid="stHeader"] {background:#f3f6fb}
-section.main > div.block-container {
-    max-width:1500px;
-    padding:1.5rem 2rem 3rem
-}
-.hero {
-    background:linear-gradient(115deg,#14243a,#244b76,#9f2530);
-    border-radius:20px;
-    padding:30px 34px;
-    margin-bottom:22px;
-    box-shadow:0 10px 28px rgba(20,36,58,.12)
-}
-.hero * {color:white!important}
-.hero .eyebrow {
-    color:#fecaca!important;
-    font-size:12px;
-    font-weight:800;
-    letter-spacing:3px
-}
-.hero h1 {font-size:40px!important;margin:10px 0!important}
-.hero p {color:#e1eafa!important;font-size:16px}
-.kicker {
-    color:#2457d6;
-    font-size:12px;
-    font-weight:800;
-    letter-spacing:1.8px;
-    margin:18px 0 6px
-}
-div[data-testid="stMetric"] {
-    background:white;
-    border:1px solid #dce4ee;
-    border-radius:15px;
-    padding:16px;
-    box-shadow:0 3px 12px rgba(20,36,58,.04)
-}
-[data-testid="stSidebar"] {
-    background:white;
-    border-right:1px solid #dce4ee
-}
-div.stButton>button,div.stDownloadButton>button {
-    border-radius:10px;
-    min-height:42px;
-    font-weight:700
-}
-div.stButton>button[kind="primary"] {
-    background:#dc2626;
-    border-color:#dc2626;
-    color:white
-}
-hr {border-color:#dce4ee}
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown("""
-<div class="hero">
-<div class="eyebrow">WILDFIRE INTELLIGENCE PLATFORM</div>
-<h1>🔥 FIREGUARD AI</h1>
-<p>Detect early. Verify intelligently. Understand risk.</p>
-<p>AI Vision • Temporal Verification • Geospatial Awareness • Evidence Analytics</p>
-</div>
-""", unsafe_allow_html=True)
+# --------------------------------------------------
+# DETECTOR
+# --------------------------------------------------
+
+@st.cache_resource
+def get_detector():
+    if not MODEL_PATH.exists():
+        return None
+    return FireDetector(str(MODEL_PATH))
 
 
-# ------------------------------ Sidebar ------------------------------
-
-with st.sidebar:
-    st.markdown("## 🚁 Mission Control")
-    st.caption("FIREGUARD / FIELD OPERATIONS")
-    st.divider()
-
-    st.markdown("### 📍 Incident coordinates")
-    latitude = st.number_input(
-        "Latitude",
-        -90.0,
-        90.0,
-        value=float(st.session_state.fg_latitude),
-        format="%.6f",
-        key="fg_latitude",
-    )
-    longitude = st.number_input(
-        "Longitude",
-        -180.0,
-        180.0,
-        value=float(st.session_state.fg_longitude),
-        format="%.6f",
-        key="fg_longitude",
-    )
-    st.caption("Example coordinates only. Enter the actual incident location.")
-
-    st.divider()
-    st.markdown("### 🎯 Detection settings")
-    confidence_threshold = st.slider(
-        "Confidence threshold",
-        0.10,
-        0.90,
-        0.35,
-        0.05,
-        key="fg_threshold",
-    )
-
-    st.divider()
-    st.markdown("### 🎞️ Video input")
-    uploaded_video = st.file_uploader(
-        "Upload fire/smoke video",
-        type=["mp4", "avi", "mov", "mkv", "mpeg", "mpg"],
-        key="fg_uploader",
-    )
-
-    if uploaded_video is not None:
-        st.success(f"Selected: {uploaded_video.name}")
-    elif DEFAULT_VIDEO_PATH.exists():
-        st.info(f"Default video: {DEFAULT_VIDEO_PATH.name}")
-    else:
-        st.warning("Upload a video to begin.")
-
-    st.divider()
-    st.markdown("### System readiness")
-    st.write("🟢 Model ready" if MODEL_PATH.exists()
-             else "🔴 Model file missing")
-    st.write(
-        "🟢 Video available"
-        if uploaded_video is not None or DEFAULT_VIDEO_PATH.exists()
-        else "🔴 No video selected"
-    )
-
-    start_button = st.button(
-        "🚨 START FIRE ANALYSIS",
-        type="primary",
-        use_container_width=True,
-    )
-
-    st.divider()
-    page_choice = st.radio(
-        "Open dashboard section",
-        [
-            "Overview",
-            "Incident Report",
-            "Evidence",
-            "Growth Analytics",
-            "Incident History",
-        ],
-        key="fg_navigation",
-        label_visibility="collapsed",
-    )
-
-
-selected_video_name = (
-    uploaded_video.name
-    if uploaded_video is not None
-    else DEFAULT_VIDEO_PATH.name
-)
-
-video_path_for_run = None
-
-if uploaded_video is not None:
-    suffix = Path(uploaded_video.name).suffix.lower()
-    if suffix not in {".mp4", ".avi", ".mov", ".mkv", ".mpeg", ".mpg"}:
-        suffix = ".mp4"
-
-    video_path_for_run = RESULTS_DIR / f"uploaded_input{suffix}"
-
-    try:
-        video_path_for_run.write_bytes(uploaded_video.getvalue())
-    except OSError as exc:
-        st.error(f"Could not save uploaded video: {exc}")
-
-elif DEFAULT_VIDEO_PATH.exists():
-    video_path_for_run = DEFAULT_VIDEO_PATH
-
-
-# ------------------------------ Helpers ------------------------------
+# --------------------------------------------------
+# DETECTION HELPERS
+# --------------------------------------------------
 
 def get_fire_confidence(detections):
-    """Highest confidence among fire detections (class ID 0)."""
-    return max(
-        (
-            float(d.get("confidence", 0.0))
-            for d in detections
-            if int(d.get("class_id", -1)) == 0
-        ),
-        default=0.0,
-    )
+    """Return the highest confidence for class ID 0."""
+    values = [
+        float(d.get("confidence", 0))
+        for d in detections
+        if int(d.get("class_id", -1)) == 0
+    ]
+    return max(values, default=0.0)
 
 
 def get_fire_area(detections):
-    """Sum of fire bounding-box pixel areas."""
-    area = 0.0
+    """Estimate total detected fire-box area in pixels."""
+    total = 0
 
-    for item in detections:
-        if int(item.get("class_id", -1)) != 0:
+    for detection in detections:
+        if int(detection.get("class_id", -1)) != 0:
+            continue
+
+        box = detection.get("box")
+        if box is None:
             continue
 
         try:
-            x1, y1, x2, y2 = map(float, item["box"])
-            area += max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        except (KeyError, TypeError, ValueError):
-            pass
+            x1, y1, x2, y2 = map(int, box)
+            total += max(0, x2 - x1) * max(0, y2 - y1)
+        except (TypeError, ValueError):
+            continue
 
-    return area
+    return total
 
 
 def draw_detections(frame, detections):
     output = frame.copy()
 
-    for item in detections:
-        x1, y1, x2, y2 = map(int, item["box"])
-        conf = float(item.get("confidence", 0.0))
-        class_id = int(item.get("class_id", -1))
+    for detection in detections:
+        try:
+            x1, y1, x2, y2 = map(
+                int, detection["box"]
+            )
+            class_id = int(detection.get("class_id", -1))
+            confidence = float(
+                detection.get("confidence", 0)
+            )
 
-        if class_id == 0:
-            label, color = f"FIRE {conf:.2f}", (0, 0, 230)
-        elif class_id == 1:
-            label, color = f"SMOKE {conf:.2f}", (0, 140, 255)
-        else:
-            label, color = f"OBJECT {conf:.2f}", (20, 150, 20)
+            label = (
+                "FIRE" if class_id == 0
+                else "SMOKE" if class_id == 1
+                else f"CLASS {class_id}"
+            )
 
-        cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            output,
-            label,
-            (x1, max(y1 - 8, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-        )
+            color = (
+                (0, 0, 255) if class_id == 0
+                else (0, 165, 255)
+            )
+
+            cv2.rectangle(
+                output, (x1, y1), (x2, y2),
+                color, 2
+            )
+
+            cv2.putText(
+                output,
+                f"{label} {confidence:.0%}",
+                (x1, max(25, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                color,
+                2,
+            )
+
+        except (KeyError, TypeError, ValueError):
+            continue
 
     return output
 
 
-def get_risk(engine, confidence, fire_area=0, growth=0, verified=False):
-    """Calculate risk using the existing RiskEngine."""
-    try:
-        result = engine.calculate(
-            fire_confidence=float(confidence),
-            fire_area=float(fire_area),
-            growth=float(growth),
-            verified=verified,
-        )
-
-        if isinstance(result, dict):
-            return {
-                "risk_score": result.get(
-                    "risk_score", result.get("score", 0)
-                ),
-                "risk_level": result.get(
-                    "risk_level", result.get("level", "LOW")
-                ),
-            }
-
-    except Exception as exc:
-        st.warning(f"Risk calculation error: {exc}")
-
-    return {"risk_score": 0, "risk_level": "LOW"}
-
-
-def risk_value(data, *keys, default=None):
-    for key in keys:
-        if key in data and data[key] is not None:
-            return data[key]
-    return default
-
-
-def draw_map(lat, lon):
-    st.map(
-        pd.DataFrame({
-            "latitude": [lat],
-            "longitude": [lon],
-        }),
-        latitude="latitude",
-        longitude="longitude",
-        size=200,
+def calculate_risk(confidence, area, growth, verification):
+    engine = RiskEngine()
+    return engine.calculate(
+        fire_confidence=confidence,
+        fire_area=area,
+        growth=growth,
+        verified=verification,
     )
 
 
-def show_history():
+def draw_location(latitude, longitude):
+    st.map(
+        pd.DataFrame({
+            "latitude": [latitude],
+            "longitude": [longitude],
+        }),
+        latitude="latitude",
+        longitude="longitude",
+        zoom=10,
+    )
+
+
+# --------------------------------------------------
+# EMAIL HELPER
+# --------------------------------------------------
+
+def send_notification(
+    status,
+    confidence,
+    risk,
+    latitude,
+    longitude,
+    timestamp,
+):
+    """
+    Uses the project's existing email-alert function.
+    Does not print email credentials or secrets.
+    """
+    if send_email_alert is None:
+        return False, (
+            "Email module could not be imported. "
+            "Check src/email_alert.py."
+        )
+
     try:
-        records = load_incidents()
+        result = send_email_alert(
+            status=status,
+            confidence=confidence,
+            risk_level=risk["level"],
+            risk_score=risk["score"],
+            latitude=latitude,
+            longitude=longitude,
+            timestamp=timestamp,
+        )
+
+        # Some implementations return None on success.
+        if result is False:
+            return False, "Email function reported failure."
+
+        return True, "Email alert sent."
+
     except Exception as exc:
-        st.error(f"Could not load incident history: {exc}")
-        return
+        return False, f"Email failed: {exc}"
+
+
+# --------------------------------------------------
+# INCIDENT HISTORY
+# --------------------------------------------------
+
+def show_history():
+    records = load_incidents()
 
     if not records:
-        st.info("No saved incidents yet.")
+        st.info("No incidents have been saved yet.")
         return
 
     df = pd.DataFrame(records)
 
-    for col in [
-        "confidence",
-        "fire_area_pixels",
-        "growth_pixels",
-        "risk_score",
-        "latitude",
-        "longitude",
-        "frames_processed",
-    ]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    numeric_columns = [
+        "confidence", "area", "growth", "risk_score",
+        "latitude", "longitude", "frames_processed",
+    ]
 
-    st.markdown("### 📋 Previous analysis runs")
+    for column in numeric_columns:
+        if column in df.columns:
+            df[column] = pd.to_numeric(
+                df[column], errors="coerce"
+            )
+
     st.dataframe(
-        df.iloc[::-1].head(50),
-        hide_index=True,
+        df.iloc[::-1],
         use_container_width=True,
+        hide_index=True,
     )
 
-    if "risk_score" in df.columns:
-        chart = df[["risk_score"]].dropna().tail(30)
-
-        if not chart.empty:
-            st.markdown("### 📈 Risk score across saved runs")
-            st.line_chart(chart, y="risk_score")
-
     st.download_button(
-        "⬇️ DOWNLOAD INCIDENT HISTORY CSV",
+        "Download incident history CSV",
         data=df.to_csv(index=False).encode("utf-8"),
         file_name="fireguard_incident_history.csv",
         mime="text/csv",
-        key="fg_history_download",
     )
 
 
-# ------------------------------ Video analysis ------------------------------
+# --------------------------------------------------
+# LIVE CAMERA SHARED STATE
+# --------------------------------------------------
 
-if start_button:
-    cap = writer = None
-    frame_number = 0
-    fire_frames = 0
-    strongest_confidence = 0.0
-    best_frame, best_detections = None, []
-    growth_data = []
-    latest_risk = {"risk_score": 0, "risk_level": "LOW"}
-    verification_result = False
-    peak_fire_area = previous_area = maximum_growth = 0.0
+LIVE_STATE = {
+    "lock": threading.Lock(),
+    "confidence": 0.0,
+    "area": 0,
+    "verification": "NO FIRE",
+    "risk": {"score": 0, "level": "LOW"},
+    "frame": None,
+    "frames_processed": 0,
+    "last_seen": None,
+    "error": None,
+}
 
-    try:
-        if not MODEL_PATH.exists():
-            st.error(f"Model file not found: {MODEL_PATH}")
 
-        elif not video_path_for_run or not Path(video_path_for_run).exists():
-            st.error("Please select a valid video file.")
+# --------------------------------------------------
+# LIVE CAMERA PROCESSOR
+# --------------------------------------------------
 
+class FireCameraProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.detector = get_detector()
+        self.verifier = FireVerifier()
+        self.risk_engine = RiskEngine()
+        self.frames_processed = 0
+        self.previous_area = 0
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+
+        if self.detector is None:
+            with LIVE_STATE["lock"]:
+                LIVE_STATE["error"] = (
+                    f"Model file not found: {MODEL_PATH}"
+                )
+
+            return av.VideoFrame.from_ndarray(
+                image, format="bgr24"
+            )
+
+        try:
+            detections = self.detector.detect(image)
+
+            confidence = get_fire_confidence(detections)
+            area = get_fire_area(detections)
+
+            verification = self.verifier.update(
+                confidence
+            )
+
+            growth = max(0, area - self.previous_area)
+            self.previous_area = area
+
+            risk = self.risk_engine.calculate(
+                fire_confidence=confidence,
+                fire_area=area,
+                growth=growth,
+                verified=verification,
+            )
+
+            annotated = draw_detections(image, detections)
+
+            status_text = (
+                "VERIFIED FIRE"
+                if verification == "VERIFIED FIRE"
+                else "POSSIBLE FIRE"
+                if verification == "POSSIBLE FIRE"
+                else "NO FIRE"
+            )
+
+            cv2.putText(
+                annotated,
+                f"{status_text} | Risk: {risk['level']}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255)
+                if verification == "VERIFIED FIRE"
+                else (0, 150, 255),
+                2,
+            )
+
+            self.frames_processed += 1
+
+            # Share only data. Do not call st.* from this worker.
+            with LIVE_STATE["lock"]:
+                LIVE_STATE["confidence"] = confidence
+                LIVE_STATE["area"] = area
+                LIVE_STATE["verification"] = verification
+                LIVE_STATE["risk"] = risk
+                LIVE_STATE["frame"] = annotated.copy()
+                LIVE_STATE["frames_processed"] = (
+                    self.frames_processed
+                )
+                LIVE_STATE["last_seen"] = (
+                    datetime.now().isoformat(
+                        timespec="seconds"
+                    )
+                )
+                LIVE_STATE["error"] = None
+
+            return av.VideoFrame.from_ndarray(
+                annotated, format="bgr24"
+            )
+
+        except Exception as exc:
+            with LIVE_STATE["lock"]:
+                LIVE_STATE["error"] = str(exc)
+
+            return av.VideoFrame.from_ndarray(
+                image, format="bgr24"
+            )
+
+
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+
+st.markdown(
+    """
+    <div class="hero">
+        <div class="eyebrow">
+            WILDFIRE INTELLIGENCE PLATFORM
+        </div>
+        <h1>🔥 FireGuard</h1>
+        <p>
+            Detect early. Verify intelligently.
+            Understand risk.
+        </p>
+        <p>
+            AI Vision • Temporal Verification •
+            Geospatial Awareness • Evidence Analytics
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# --------------------------------------------------
+# SIDEBAR
+# --------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## 🔥 FireGuard")
+    st.caption("AI fire monitoring dashboard")
+    st.divider()
+
+    latitude = st.number_input(
+        "Latitude",
+        value=float(st.session_state.fg_latitude),
+        format="%.6f",
+    )
+
+    longitude = st.number_input(
+        "Longitude",
+        value=float(st.session_state.fg_longitude),
+        format="%.6f",
+    )
+
+    st.session_state.fg_latitude = latitude
+    st.session_state.fg_longitude = longitude
+
+    confidence_threshold = st.slider(
+        "Fire confidence threshold",
+        min_value=0.10,
+        max_value=0.90,
+        value=0.35,
+        step=0.05,
+    )
+
+    st.divider()
+
+    uploaded_video = st.file_uploader(
+        "Upload video for analysis",
+        type=["mp4", "mov", "avi", "mkv"],
+    )
+
+    default_video = VIDEO_DIR / "fire.mp4"
+
+    if uploaded_video is not None:
+        input_video = RESULTS_DIR / uploaded_video.name
+
+        if st.button(
+            "Save uploaded video",
+            use_container_width=True,
+        ):
+            input_video.write_bytes(
+                uploaded_video.getvalue()
+            )
+            st.session_state.fg_last_video = str(
+                input_video
+            )
+            st.success("Video saved.")
+
+    elif st.session_state.fg_last_video:
+        input_video = Path(
+            st.session_state.fg_last_video
+        )
+
+    else:
+        input_video = default_video
+
+    page = st.radio(
+        "NAVIGATION",
+        [
+            "Overview",
+            "Live Camera",
+            "Video Analysis",
+            "Incident Report",
+            "Evidence",
+            "Growth Analytics",
+            "Incident History",
+        ],
+    )
+
+    st.divider()
+    st.caption("FireGuard • AI-assisted monitoring")
+
+
+# --------------------------------------------------
+# MODEL AVAILABILITY
+# --------------------------------------------------
+
+if not MODEL_PATH.exists():
+    st.error(
+        f"Model not found: {MODEL_PATH}. "
+        "Ensure models/best.pt exists in the project."
+    )
+
+
+# --------------------------------------------------
+# LIVE CAMERA PAGE
+# --------------------------------------------------
+
+if page == "Live Camera":
+    st.markdown(
+        '<div class="kicker">REAL-TIME MONITORING</div>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("Live Camera Detection")
+
+    st.write(
+        "Allow browser camera access. "
+        "Keep the camera running while reviewing detections."
+    )
+
+    if not MODEL_PATH.exists():
+        st.error("Cannot start camera detection without best.pt.")
+    else:
+        webrtc_streamer(
+            key="fireguard-live-camera",
+            video_processor_factory=FireCameraProcessor,
+            media_stream_constraints={
+                "video": True,
+                "audio": False,
+            },
+            async_processing=True,
+        )
+
+    st.divider()
+    st.subheader("Latest camera results")
+
+    if st.button("Refresh live results"):
+        pass
+
+    with LIVE_STATE["lock"]:
+        live_confidence = LIVE_STATE["confidence"]
+        live_area = LIVE_STATE["area"]
+        live_verification = LIVE_STATE["verification"]
+        live_risk = dict(LIVE_STATE["risk"])
+        live_frame = (
+            LIVE_STATE["frame"].copy()
+            if LIVE_STATE["frame"] is not None
+            else None
+        )
+        live_frames = LIVE_STATE["frames_processed"]
+        live_seen = LIVE_STATE["last_seen"]
+        live_error = LIVE_STATE["error"]
+
+    if live_error:
+        st.error(f"Camera processing issue: {live_error}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Fire confidence", f"{live_confidence:.1%}")
+    m2.metric("Detected area", f"{live_area:,} px²")
+    m3.metric("Risk", live_risk["level"])
+    m4.metric("Frames processed", live_frames)
+
+    st.info(f"Verification: {live_verification}")
+
+    if live_seen:
+        st.caption(f"Last processed frame: {live_seen}")
+
+    if live_frame is not None:
+        st.image(
+            cv2.cvtColor(live_frame, cv2.COLOR_BGR2RGB),
+            caption="Latest annotated camera frame",
+            use_container_width=True,
+        )
+
+    st.warning(
+        "A model detection is not proof of a real fire. "
+        "Verify the scene before contacting emergency services."
+    )
+
+    can_save_live = (
+        live_verification == "VERIFIED FIRE"
+        and live_confidence >= confidence_threshold
+    )
+
+    if can_save_live:
+        st.success(
+            "The current camera result meets the "
+            "verification and confidence conditions."
+        )
+    else:
+        st.caption(
+            "Saving a confirmed live incident requires "
+            "VERIFIED FIRE and confidence above your threshold."
+        )
+
+    if st.button(
+        "Save verified live incident and send email",
+        type="primary",
+        disabled=not can_save_live,
+        use_container_width=True,
+    ):
+        incident_key = (
+            live_seen,
+            round(live_confidence, 3),
+            live_area,
+        )
+
+        if incident_key == st.session_state.fg_live_saved_key:
+            st.info(
+                "This live result has already been saved. "
+                "Wait for a new result before saving again."
+            )
         else:
-            detector = FireDetector(str(MODEL_PATH))
-            tracker = FireTracker()
-            verifier = FireVerifier()
-            risk_engine = RiskEngine()
+            timestamp = datetime.now().isoformat(
+                timespec="seconds"
+            )
 
-            cap = cv2.VideoCapture(str(video_path_for_run))
+            report = (
+                "FIREGUARD LIVE CAMERA INCIDENT\n"
+                f"Timestamp: {timestamp}\n"
+                f"Status: VERIFIED FIRE\n"
+                f"Confidence: {live_confidence:.1%}\n"
+                f"Area: {live_area}\n"
+                f"Risk: {live_risk['level']}\n"
+                f"Risk score: {live_risk['score']}\n"
+                f"Latitude: {latitude}\n"
+                f"Longitude: {longitude}\n"
+                f"Frames processed: {live_frames}\n"
+            )
+
+            save_incident(
+                status="FIRE ALERT",
+                confidence=live_confidence,
+                area=live_area,
+                growth=0,
+                trend="live camera",
+                risk_level=live_risk["level"],
+                risk_score=live_risk["score"],
+                latitude=latitude,
+                longitude=longitude,
+                frames_processed=live_frames,
+            )
+
+            if live_frame is not None:
+                photo_path = RESULTS_DIR / "live_evidence.jpg"
+                cv2.imwrite(str(photo_path), live_frame)
+                st.session_state.fg_photo = str(photo_path)
+
+            st.session_state.fg_status = "FIRE ALERT"
+            st.session_state.fg_confidence = live_confidence
+            st.session_state.fg_risk_level = live_risk["level"]
+            st.session_state.fg_risk_score = live_risk["score"]
+            st.session_state.fg_frames = live_frames
+            st.session_state.fg_report = report
+            st.session_state.fg_live_saved_key = incident_key
+
+            success, message = send_notification(
+                "FIRE ALERT",
+                live_confidence,
+                live_risk,
+                latitude,
+                longitude,
+                timestamp,
+            )
+
+            st.session_state.fg_email_notice = message
+
+            st.success("Live incident saved to history.")
+            if success:
+                st.success(message)
+            else:
+                st.warning(
+                    "Incident saved, but email was not confirmed: "
+                    + message
+                )
+
+    if st.session_state.fg_email_notice:
+        st.caption(
+            "Most recent email status: "
+            + str(st.session_state.fg_email_notice)
+        )
+
+
+# --------------------------------------------------
+# VIDEO ANALYSIS PAGE
+# --------------------------------------------------
+
+elif page == "Video Analysis":
+    st.markdown(
+        '<div class="kicker">VIDEO FORENSICS</div>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("Analyze a fire-monitoring video")
+
+    if not input_video.exists():
+        st.warning(
+            f"Video not found: {input_video}. "
+            "Upload a video in the sidebar or add videos/fire.mp4."
+        )
+    elif not MODEL_PATH.exists():
+        st.error("Model file is missing.")
+    else:
+        st.write(f"Input video: `{input_video.name}`")
+
+        if st.button(
+            "START FIRE ANALYSIS",
+            type="primary",
+            use_container_width=True,
+        ):
+            cap = cv2.VideoCapture(str(input_video))
 
             if not cap.isOpened():
-                st.error("Could not open the selected video.")
-
+                st.error("Could not open the input video.")
             else:
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+                detector = get_detector()
+                tracker = FireTracker()
+                verifier = FireVerifier(
+                    threshold=confidence_threshold
+                )
+                risk_engine = RiskEngine()
+
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if not fps or fps <= 0:
+                    fps = 20.0
+
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(
+                    cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                )
 
-                if width <= 0 or height <= 0:
-                    st.error("The video has invalid dimensions.")
+                output_path = RESULTS_DIR / (
+                    f"fireguard_annotated_"
+                    f"{datetime.now():%Y%m%d_%H%M%S}.mp4"
+                )
 
+                writer = cv2.VideoWriter(
+                    str(output_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    fps,
+                    (width, height),
+                )
+
+                progress = st.progress(0)
+                preview = st.empty()
+                status_box = st.empty()
+                metrics_box = st.empty()
+
+                best_confidence = 0.0
+                best_frame = None
+                last_confidence = 0.0
+                last_area = 0
+                last_growth = 0
+                verified_fire_seen = False
+                frames_processed = 0
+                growth_history = []
+                previous_area = 0
+                last_risk = {"score": 0, "level": "LOW"}
+                last_verification = "NO FIRE"
+
+                while cap.isOpened():
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+
+                    detections = detector.detect(frame)
+                    tracker.update(detections)
+
+                    confidence = get_fire_confidence(detections)
+                    area = get_fire_area(detections)
+                    growth = max(0, area - previous_area)
+                    previous_area = area
+
+                    verification = verifier.update(confidence)
+
+                    if verification == "VERIFIED FIRE":
+                        verified_fire_seen = True
+
+                    risk = risk_engine.calculate(
+                        fire_confidence=confidence,
+                        fire_area=area,
+                        growth=growth,
+                        verified=verification,
+                    )
+
+                    annotated = draw_detections(frame, detections)
+
+                    cv2.putText(
+                        annotated,
+                        f"Confidence: {confidence:.1%} | "
+                        f"Risk: {risk['level']} ({risk['score']})",
+                        (15, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (0, 0, 255)
+                        if verification == "VERIFIED FIRE"
+                        else (0, 165, 255),
+                        2,
+                    )
+
+                    writer.write(annotated)
+                    frames_processed += 1
+
+                    growth_history.append({
+                        "frame": frames_processed,
+                        "confidence": confidence,
+                        "area": area,
+                        "growth": growth,
+                        "risk_score": risk["score"],
+                    })
+
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best_frame = annotated.copy()
+
+                    last_confidence = confidence
+                    last_area = area
+                    last_growth = growth
+                    last_risk = risk
+                    last_verification = verification
+
+                    if total_frames > 0:
+                        progress.progress(
+                            min(frames_processed / total_frames, 1.0)
+                        )
+
+                    preview.image(
+                        cv2.cvtColor(
+                            annotated, cv2.COLOR_BGR2RGB
+                        ),
+                        use_container_width=True,
+                    )
+
+                    metrics_box.metric(
+                        "Current confidence",
+                        f"{confidence:.1%}",
+                    )
+                    status_box.write(
+                        f"Verification: **{verification}** · "
+                        f"Risk: **{risk['level']}** "
+                        f"({risk['score']}/100)"
+                    )
+
+                cap.release()
+                writer.release()
+                progress.progress(1.0)
+
+                if frames_processed == 0:
+                    st.error("No frames could be processed.")
                 else:
-                    writer = cv2.VideoWriter(
-                        str(ANNOTATED_VIDEO_PATH),
-                        cv2.VideoWriter_fourcc(*"mp4v"),
-                        fps,
-                        (width, height),
+                    confirmed = (
+                        verified_fire_seen
+                        and best_confidence >= confidence_threshold
                     )
 
-                    if not writer.isOpened():
-                        writer.release()
-                        writer = None
-
-                    st.info(f"Analyzing video: {selected_video_name}")
-                    progress = st.progress(0)
-                    frame_display = st.empty()
-                    status_slot, confidence_slot = st.empty(), st.empty()
-                    risk_slot, telemetry_slot = st.empty(), st.empty()
-                    verification_slot = st.empty()
-
-                    status_slot.info("AI analysis is running...")
-
-                    while True:
-                        ok, frame = cap.read()
-                        if not ok:
-                            break
-
-                        frame_number += 1
-                        detections = detector.detect(frame)
-                        tracker.update(detections)
-
-                        fire_conf = get_fire_confidence(detections)
-                        fire_area = get_fire_area(detections)
-                        growth = max(0.0, fire_area - previous_area)
-
-                        peak_fire_area = max(peak_fire_area, fire_area)
-                        maximum_growth = max(maximum_growth, growth)
-                        previous_area = fire_area
-
-                        growth_data.append({
-                            "frame": frame_number,
-                            "confidence": fire_conf,
-                            "fire_area_pixels": fire_area,
-                        })
-
-                        if fire_conf > 0:
-                            fire_frames += 1
-
-                        if fire_conf > strongest_confidence:
-                            strongest_confidence = fire_conf
-                            best_frame = frame.copy()
-                            best_detections = list(detections)
-
-                        try:
-                            verification_result = verifier.update(fire_conf)
-                        except Exception:
-                            verification_result = (
-                                fire_conf >= confidence_threshold
-                            )
-
-                        latest_risk = get_risk(
-                            risk_engine,
-                            fire_conf,
-                            fire_area=fire_area,
-                            growth=growth,
-                            verified=verification_result,
-                        )
-
-                        annotated = draw_detections(frame, detections)
-
-                        if writer is not None:
-                            writer.write(annotated)
-
-                        if frame_number % 3 == 0 or frame_number == 1:
-                            frame_display.image(
-                                cv2.cvtColor(
-                                    annotated, cv2.COLOR_BGR2RGB
-                                ),
-                                caption=f"Processed frame {frame_number}",
-                                use_container_width=True,
-                            )
-
-                        if total_frames > 0:
-                            progress.progress(
-                                min(frame_number / total_frames, 1.0)
-                            )
-
-                        confidence_slot.metric(
-                            "CURRENT FIRE CONFIDENCE",
-                            f"{fire_conf * 100:.1f}%",
-                        )
-
-                        risk_slot.metric(
-                            "RISK LEVEL",
-                            str(
-                                risk_value(
-                                    latest_risk,
-                                    "risk_level",
-                                    "level",
-                                    default="LOW",
-                                )
-                            ).upper(),
-                        )
-
-                        telemetry_slot.caption(
-                            f"Frames processed: {frame_number} | "
-                            f"Fire detections: {fire_frames} | "
-                            f"Current fire-box area: {fire_area:,.0f} pixels"
-                        )
-
-                        verification_slot.write(
-                            f"Verification result: {verification_result}"
-                        )
-
-                    progress.progress(1.0)
-
-                    if writer is not None:
-                        writer.release()
-                        writer = None
-
-                    cap.release()
-                    cap = None
-
-                    photo_bytes = None
-
-                    if best_frame is not None:
-                        evidence_frame = draw_detections(
-                            best_frame, best_detections
-                        )
-                        ok_jpg, encoded = cv2.imencode(
-                            ".jpg", evidence_frame
-                        )
-
-                        if ok_jpg:
-                            photo_bytes = encoded.tobytes()
-
-                    risk_level = str(
-                        risk_value(
-                            latest_risk,
-                            "risk_level",
-                            "level",
-                            default="LOW",
-                        )
-                    ).upper()
-
-                    try:
-                        risk_score = float(
-                            risk_value(
-                                latest_risk,
-                                "risk_score",
-                                "score",
-                                default=0,
-                            )
-                        )
-                    except (TypeError, ValueError):
-                        risk_score = 0.0
-
-                    # Preserve the existing verifier's output rather than
-                    # assuming it always returns a particular string.
-                    verification_text = str(verification_result).upper()
-                    verified_fire = (
-                        verification_result is True
-                        or verification_text == "VERIFIED FIRE"
-                    )
-
-                    fire_confirmed = (
-                        strongest_confidence >= confidence_threshold
-                        and verified_fire
-                    )
-
-                    if (
-                        fire_confirmed
-                        or risk_level in {"HIGH", "CRITICAL", "SEVERE"}
-                    ):
+                    if confirmed:
                         final_status = "FIRE ALERT"
-                    elif strongest_confidence > 0:
+                    elif best_confidence >= confidence_threshold:
                         final_status = "POSSIBLE FIRE — REVIEW"
                     else:
                         final_status = "NO FIRE DETECTED"
 
-                    st.session_state.fg_growth = growth_data
-                    st.session_state.fg_photo = photo_bytes
-                    st.session_state.fg_video = (
-                        str(ANNOTATED_VIDEO_PATH)
-                        if ANNOTATED_VIDEO_PATH.exists()
-                        and ANNOTATED_VIDEO_PATH.stat().st_size > 0
-                        else None
+                    timestamp = datetime.now().isoformat(
+                        timespec="seconds"
                     )
-                    st.session_state.fg_original = str(video_path_for_run)
-                    st.session_state.fg_original_name = selected_video_name
-                    st.session_state.fg_last_video = selected_video_name
+
+                    report = (
+                        "FIREGUARD INCIDENT REPORT\n"
+                        f"Timestamp: {timestamp}\n"
+                        f"Video: {input_video.name}\n"
+                        f"Status: {final_status}\n"
+                        f"Verification: {last_verification}\n"
+                        f"Best confidence: {best_confidence:.1%}\n"
+                        f"Last detected area: {last_area}\n"
+                        f"Last growth: {last_growth}\n"
+                        f"Risk level: {last_risk['level']}\n"
+                        f"Risk score: {last_risk['score']}/100\n"
+                        f"Frames processed: {frames_processed}\n"
+                        f"Latitude: {latitude}\n"
+                        f"Longitude: {longitude}\n"
+                    )
+
+                    save_incident(
+                        status=final_status,
+                        confidence=best_confidence,
+                        area=last_area,
+                        growth=last_growth,
+                        trend="increasing"
+                        if last_growth > 0 else "stable",
+                        risk_level=last_risk["level"],
+                        risk_score=last_risk["score"],
+                        latitude=latitude,
+                        longitude=longitude,
+                        frames_processed=frames_processed,
+                    )
+
                     st.session_state.fg_status = final_status
-                    st.session_state.fg_confidence = strongest_confidence
-                    st.session_state.fg_risk_level = risk_level
-                    st.session_state.fg_risk_score = risk_score
-                    st.session_state.fg_frames = frame_number
-
-                    report = f"""
-FIREGUARD AI — INCIDENT REPORT
-================================
-Analysis time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-Input video: {selected_video_name}
-Final status: {final_status}
-Frames processed: {frame_number}
-Frames with fire detections: {fire_frames}
-Highest fire confidence: {strongest_confidence * 100:.2f}%
-Peak fire bounding-box area: {peak_fire_area:.0f} pixels
-Maximum frame-to-frame area increase: {maximum_growth:.0f} pixels
-Risk level: {risk_level}
-Risk score: {risk_score:.2f}
-Latitude: {latitude:.6f}
-Longitude: {longitude:.6f}
-
-Note: AI-assisted screening only. Bounding-box area is a pixel measurement,
-not physical fire size. Review evidence and follow official emergency procedures.
-""".strip()
-
+                    st.session_state.fg_confidence = best_confidence
+                    st.session_state.fg_risk_level = last_risk["level"]
+                    st.session_state.fg_risk_score = last_risk["score"]
+                    st.session_state.fg_frames = frames_processed
                     st.session_state.fg_report = report
+                    st.session_state.fg_photo = (
+                        RESULTS_DIR / "best_fire_frame.jpg"
+                    ).as_posix() if best_frame is not None else None
+                    st.session_state.fg_video = str(output_path)
+                    st.session_state.fg_original = str(input_video)
+                    st.session_state.fg_original_name = input_video.name
+                    st.session_state.fg_growth = growth_history
+                    st.session_state.fg_last_video = str(input_video)
 
-                    try:
-                        save_incident(
-                            status=final_status,
-                            confidence=strongest_confidence,
-                            area=peak_fire_area,
-                            growth=maximum_growth,
-                            trend=(
-                                "increasing"
-                                if maximum_growth > 0
-                                else "stable"
-                            ),
-                            risk_level=risk_level,
-                            risk_score=risk_score,
-                            latitude=latitude,
-                            longitude=longitude,
-                            frames_processed=frame_number,
-                        )
-                    except Exception as exc:
-                        st.warning(
-                            "Analysis completed, but history could not "
-                            f"be saved: {exc}"
+                    if best_frame is not None:
+                        cv2.imwrite(
+                            str(RESULTS_DIR / "best_fire_frame.jpg"),
+                            best_frame,
                         )
 
-                    # Send one alert after the video analysis is complete.
-                    st.session_state.fg_email_notice = None
+                    st.success(f"Analysis complete: {final_status}")
+                    st.write(report)
 
-                    if final_status == "FIRE ALERT":
-                        if send_email_alert is None:
-                            st.session_state.fg_email_notice = (
-                                "Email module could not be imported. "
-                                "Check src/email_alert.py."
-                            )
+                    if final_status in (
+                        "FIRE ALERT",
+                        "POSSIBLE FIRE — REVIEW",
+                    ):
+                        success, message = send_notification(
+                            final_status,
+                            best_confidence,
+                            last_risk,
+                            latitude,
+                            longitude,
+                            timestamp,
+                        )
+                        st.session_state.fg_email_notice = message
+
+                        if success:
+                            st.success(message)
                         else:
-                            try:
-                                email_result = send_email_alert(
-                                    status=final_status,
-                                    confidence=strongest_confidence,
-                                    risk_level=risk_level,
-                                    risk_score=risk_score,
-                                    latitude=latitude,
-                                    longitude=longitude,
-                                    timestamp=datetime.now().strftime(
-                                        "%Y-%m-%d %H:%M:%S"
-                                    ),
-                                )
-
-                                if (
-                                    isinstance(email_result, tuple)
-                                    and len(email_result) == 2
-                                ):
-                                    email_success, email_message = email_result
-                                else:
-                                    email_success = bool(email_result)
-                                    email_message = str(email_result)
-
-                                st.session_state.fg_email_notice = (
-                                    str(email_message)
-                                )
-
-                                if email_success:
-                                    st.success(
-                                        "Email alert sent successfully."
-                                    )
-                                else:
-                                    st.warning(
-                                        f"Email alert not sent: {email_message}"
-                                    )
-
-                            except Exception as exc:
-                                st.session_state.fg_email_notice = (
-                                    "Email alert failed: "
-                                    f"{type(exc).__name__}: {exc}"
-                                )
-
-                    status_slot.success(
-                        f"Analysis finished: {final_status}"
-                    )
-                    st.success(
-                        "Video analysis finished. Open other sections "
-                        "using the sidebar."
-                    )
-
-    except Exception as exc:
-        st.error(f"Analysis could not finish: {exc}")
-        st.info(
-            "Check that detector, tracker, verifier and risk engine "
-            "modules are configured correctly."
-        )
-
-    finally:
-        if cap is not None:
-            cap.release()
-        if writer is not None:
-            writer.release()
+                            st.warning(
+                                "Incident saved, but email was not confirmed: "
+                                + message
+                            )
+                    else:
+                        st.info(
+                            "No alert email was sent because the "
+                            "analysis did not meet the alert conditions."
+                        )
 
 
-# ------------------------------ Dashboard pages ------------------------------
+# --------------------------------------------------
+# OVERVIEW PAGE
+# --------------------------------------------------
 
-if page_choice == "Overview":
+elif page == "Overview":
     st.markdown(
-        '<div class="kicker">01 / MISSION OVERVIEW</div>',
+        '<div class="kicker">SYSTEM OVERVIEW</div>',
         unsafe_allow_html=True,
+    )
+
+    incidents = load_incidents()
+    df = pd.DataFrame(incidents)
+
+    total_incidents = len(df)
+    fire_alerts = (
+        int(df["status"].astype(str).str.contains(
+            "FIRE ALERT", case=False
+        ).sum())
+        if not df.empty and "status" in df.columns
+        else 0
     )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("FIRE STATUS", st.session_state.fg_status)
-    c2.metric(
-        "CONFIDENCE",
-        (
-            f"{st.session_state.fg_confidence * 100:.1f}%"
-            if st.session_state.fg_report
-            else "—"
-        ),
-    )
-    c3.metric(
-        "FRAMES PROCESSED",
-        st.session_state.fg_frames or "—",
-    )
+    c1.metric("System status", st.session_state.fg_status)
+    c2.metric("Saved incidents", total_incidents)
+    c3.metric("Fire alerts", fire_alerts)
     c4.metric(
-        "RISK LEVEL",
-        st.session_state.fg_risk_level,
-        (
-            f"Score: {st.session_state.fg_risk_score:.1f}"
-            if st.session_state.fg_report
-            else None
-        ),
+        "Latest confidence",
+        f"{st.session_state.fg_confidence:.1%}",
     )
 
-    st.divider()
-    left, right = st.columns([1.5, 1])
+    st.subheader("Latest analysis")
+    left, right = st.columns([1.2, 1])
 
     with left:
-        st.markdown("### 🎥 Latest analysis")
+        st.write(
+            f"**Status:** {st.session_state.fg_status}"
+        )
+        st.write(
+            f"**Risk level:** {st.session_state.fg_risk_level}"
+        )
+        st.write(
+            f"**Risk score:** {st.session_state.fg_risk_score}/100"
+        )
+        st.write(
+            f"**Frames processed:** {st.session_state.fg_frames}"
+        )
 
-        if (
-            st.session_state.fg_video
-            and Path(st.session_state.fg_video).exists()
-        ):
-            st.video(st.session_state.fg_video)
-
-        elif (
-            st.session_state.fg_original
-            and Path(st.session_state.fg_original).exists()
-        ):
-            st.video(st.session_state.fg_original)
-
-        else:
-            st.info("Run an analysis to view the video here.")
+        if st.session_state.fg_report:
+            st.text(st.session_state.fg_report)
 
     with right:
-        st.markdown("### 📡 Incident location")
-        st.write(f"Latitude: {latitude:.6f}")
-        st.write(f"Longitude: {longitude:.6f}")
-        draw_map(latitude, longitude)
-        st.caption(
-            "Manually entered coordinates; not extracted from the video."
+        st.subheader("Monitoring location")
+        draw_location(latitude, longitude)
+
+
+# --------------------------------------------------
+# INCIDENT REPORT PAGE
+# --------------------------------------------------
+
+elif page == "Incident Report":
+    st.markdown(
+        '<div class="kicker">INCIDENT DOCUMENTATION</div>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("Incident Report")
+
+    if not st.session_state.fg_report:
+        st.info("Run video analysis or save a verified live incident first.")
+    else:
+        st.code(st.session_state.fg_report)
+
+        st.download_button(
+            "Download incident report",
+            data=st.session_state.fg_report,
+            file_name="fireguard_incident_report.txt",
+            mime="text/plain",
         )
 
     if st.session_state.fg_email_notice:
-        st.info(st.session_state.fg_email_notice)
-
-    st.divider()
-    st.markdown("### ⚡ Dashboard sections")
-    st.caption(
-        "Use the sidebar to open Incident Report, Evidence, "
-        "Growth Analytics, or Incident History."
-    )
+        st.info(
+            f"Latest email status: {st.session_state.fg_email_notice}"
+        )
 
 
-elif page_choice == "Incident Report":
+# --------------------------------------------------
+# EVIDENCE PAGE
+# --------------------------------------------------
+
+elif page == "Evidence":
     st.markdown(
-        '<div class="kicker">02 / INCIDENT REPORT</div>',
+        '<div class="kicker">EVIDENCE VAULT</div>',
         unsafe_allow_html=True,
     )
-    st.title("📄 AI Incident Report")
+    st.subheader("Captured Evidence")
 
-    report = st.session_state.fg_report
+    photo = st.session_state.fg_photo
 
-    if report:
-        st.success("Incident report is ready.")
-        st.text_area(
-            "Report contents",
-            value=report,
-            height=360,
-            disabled=True,
-        )
-        st.download_button(
-            "⬇️ DOWNLOAD INCIDENT REPORT",
-            data=report,
-            file_name="fireguard_incident_report.txt",
-            mime="text/plain",
-            key="fg_report_download",
-        )
+    if photo:
+        photo_path = Path(photo)
+        if photo_path.exists():
+            st.image(
+                str(photo_path),
+                caption="Annotated evidence frame",
+                use_container_width=True,
+            )
+            st.download_button(
+                "Download evidence image",
+                data=photo_path.read_bytes(),
+                file_name=photo_path.name,
+                mime="image/jpeg",
+            )
+        else:
+            st.info("The saved evidence image is unavailable.")
     else:
-        st.info("No report yet. Run the video analysis first.")
+        st.info("No evidence image saved yet.")
 
+    for label, key in [
+        ("Annotated video", "fg_video"),
+        ("Original video", "fg_original"),
+    ]:
+        value = st.session_state.get(key)
 
-elif page_choice == "Evidence":
-    st.markdown(
-        '<div class="kicker">03 / EVIDENCE</div>',
-        unsafe_allow_html=True,
-    )
-    st.title("🖼️ Incident Evidence")
+        if value and Path(value).exists():
+            path = Path(value)
+            st.write(f"**{label}:** {path.name}")
 
-    if not st.session_state.fg_report:
-        st.info("Run an analysis first to generate evidence.")
-
-    else:
-        photo = st.session_state.fg_photo
-        video = st.session_state.fg_video
-        original = st.session_state.fg_original
-
-        photo_col, video_col = st.columns(2)
-
-        with photo_col:
-            st.markdown("### 📸 Strongest detection photo")
-
-            if photo:
-                st.image(
-                    photo,
-                    caption="Strongest detected frame",
-                    use_container_width=True,
-                )
-                st.download_button(
-                    "⬇️ DOWNLOAD DETECTION PHOTO",
-                    data=photo,
-                    file_name="fireguard_fire_evidence.jpg",
-                    mime="image/jpeg",
-                    key="fg_photo_download",
-                )
-            else:
-                st.info("No detection photo was saved.")
-
-        with video_col:
-            st.markdown("### 🎬 Annotated evidence video")
-
-            if video and Path(video).exists():
-                st.video(video)
-                st.download_button(
-                    "⬇️ DOWNLOAD ANNOTATED VIDEO",
-                    data=Path(video).read_bytes(),
-                    file_name="fireguard_evidence.mp4",
-                    mime="video/mp4",
-                    key="fg_annotated_download",
-                )
-            else:
-                st.info("No annotated video is available.")
-
-        if original and Path(original).exists():
-            st.markdown("### 🎥 Original input video")
-            st.video(original)
+            mime = (
+                "video/mp4"
+                if path.suffix.lower() == ".mp4"
+                else "application/octet-stream"
+            )
 
             st.download_button(
-                "⬇️ DOWNLOAD ORIGINAL VIDEO",
-                data=Path(original).read_bytes(),
-                file_name=(
-                    st.session_state.fg_original_name
-                    or "fireguard_input_video.mp4"
-                ),
-                mime="video/mp4",
-                key="fg_original_download",
+                f"Download {label.lower()}",
+                data=path.read_bytes(),
+                file_name=path.name,
+                mime=mime,
+                key=f"download_{key}",
             )
 
 
-elif page_choice == "Growth Analytics":
+# --------------------------------------------------
+# GROWTH ANALYTICS PAGE
+# --------------------------------------------------
+
+elif page == "Growth Analytics":
     st.markdown(
-        '<div class="kicker">04 / FIRE DYNAMICS</div>',
+        '<div class="kicker">TEMPORAL ANALYTICS</div>',
         unsafe_allow_html=True,
     )
-    st.title("📈 Growth Analytics")
+    st.subheader("Fire Detection and Growth")
 
-    growth = st.session_state.fg_growth
+    growth_history = st.session_state.fg_growth
 
-    if growth:
-        growth_df = pd.DataFrame(growth)
-
-        st.markdown("### Fire confidence per frame")
-        st.line_chart(
-            growth_df,
-            x="frame",
-            y="confidence",
-            use_container_width=True,
-        )
-
-        st.markdown("### Fire bounding-box area per frame")
-        st.line_chart(
-            growth_df,
-            x="frame",
-            y="fire_area_pixels",
-            use_container_width=True,
-        )
-
-        st.caption(
-            "Box area is measured in pixels, not physical fire size."
-        )
-        st.markdown("### Recent frame results")
-        st.dataframe(
-            growth_df.tail(20),
-            hide_index=True,
-            use_container_width=True,
-        )
-
+    if not growth_history:
+        st.info("Run video analysis to generate analytics.")
     else:
-        st.info("Run an analysis to generate the graph.")
+        growth_df = pd.DataFrame(growth_history)
+
+        chart_columns = [
+            column for column in
+            ["confidence", "area", "growth", "risk_score"]
+            if column in growth_df.columns
+        ]
+
+        selected_metric = st.selectbox(
+            "Select metric",
+            chart_columns,
+        )
+
+        st.line_chart(
+            growth_df.set_index("frame")[[selected_metric]]
+        )
+
+        st.dataframe(
+            growth_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download growth analytics CSV",
+            data=growth_df.to_csv(index=False).encode("utf-8"),
+            file_name="fireguard_growth_analytics.csv",
+            mime="text/csv",
+        )
 
 
-elif page_choice == "Incident History":
+# --------------------------------------------------
+# INCIDENT HISTORY PAGE
+# --------------------------------------------------
+
+elif page == "Incident History":
     st.markdown(
-        '<div class="kicker">05 / HISTORICAL INTELLIGENCE</div>',
+        '<div class="kicker">INCIDENT ARCHIVE</div>',
         unsafe_allow_html=True,
     )
-    st.title("🗂️ Incident History")
-    st.caption(
-        "Saved analysis records are loaded from the existing history module."
-    )
+    st.subheader("Incident History")
     show_history()
 
 
+# --------------------------------------------------
+# FOOTER
+# --------------------------------------------------
+
 st.divider()
 st.caption(
-    "FIREGUARD AI • AI-assisted fire and smoke monitoring • "
-    "Always follow official emergency procedures."
+    "FireGuard is an AI-assisted monitoring prototype. "
+    "Detections and risk scores require human verification."
 )
