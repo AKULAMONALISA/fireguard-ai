@@ -16,15 +16,15 @@ def send_email_alert(
     timestamp=None,
 ):
     # Read all email details only from Streamlit Secrets
-    try:
-        config = st.secrets["email"]
-        sender_email = str(config["sender"]).strip()
-        receiver_email = str(config["receiver"]).strip()
-        app_password = str(config["password"]).replace(" ", "").strip()
-    except (KeyError, FileNotFoundError):
-        return False, (
-            "Email settings missing. Configure sender, receiver, "
-            "and password under Streamlit Cloud Secrets."
+   
+try:
+    config = st.secrets["email"]
+    sender_email = str(config["sender"]).strip()
+    receiver_email = str(config["receiver"]).strip()
+    app_password = str(config["password"]).replace(" ", "").strip()
+except (KeyError, FileNotFoundError):
+    return False, "Email settings missing in Streamlit Secrets."
+
         )
     except Exception as exc:
         return False, f"Unable to read email secrets: {exc}"
