@@ -1,5 +1,4 @@
 ﻿
-import os
 import ssl
 import smtplib
 from email.message import EmailMessage
@@ -16,34 +15,22 @@ def send_email_alert(
     longitude=None,
     timestamp=None,
 ):
-    sender_email = "akulamonalisa@gmail.com"
-    receiver_email = "akulamonalisa123@gmail.com"
-    app_password = "nwcuunobrdqkuqwv"
-
-    # Read password securely from Streamlit Secrets
+    # Read all email details only from Streamlit Secrets
     try:
-        config = st.secrets.get("email", {})
-        sender_email = str(
-            config.get("sender", sender_email)
-        ).strip()
-        receiver_email = str(
-            config.get("receiver", receiver_email)
-        ).strip()
-        app_password = str(
-            config.get("password", "")
-        ).replace(" ", "").strip()
-    except Exception:
-        pass
-
-    # Support local environment variables too
-    app_password = app_password or os.getenv(
-        "FIREGUARD_APP_PASSWORD", ""
-    ).replace(" ", "").strip()
+        config = st.secrets["email"]
+        sender_email = str(config["sender"]).strip()
+        receiver_email = str(config["receiver"]).strip()
+        app_password = str(config["password"]).replace(" ", "").strip()
+    except (KeyError, FileNotFoundError):
+        return False, (
+            "Email settings missing. Configure sender, receiver, "
+            "and password under Streamlit Cloud Secrets."
+        )
+    except Exception as exc:
+        return False, f"Unable to read email secrets: {exc}"
 
     if not sender_email or not receiver_email or not app_password:
-        return False, (
-            "Email credentials missing. Check Streamlit Cloud Secrets."
-        )
+        return False, "Email sender, receiver, or password is empty."
 
     msg = EmailMessage()
     msg["Subject"] = f"FIREGUARD AI ALERT: {status}"
