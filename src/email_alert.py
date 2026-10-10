@@ -24,8 +24,6 @@ try:
     app_password = str(config["password"]).replace(" ", "").strip()
 except (KeyError, FileNotFoundError):
     return False, "Email settings missing in Streamlit Secrets."
-
-        )
     except Exception as exc:
         return False, f"Unable to read email secrets: {exc}"
 
